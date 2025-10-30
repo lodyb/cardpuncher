@@ -36,7 +36,8 @@ except ImportError as e:
 class Config:
     card_width_mm: float = 63.0
     card_height_mm: float = 88.0
-    bleed_mm: float = 3.175
+    bleed_mm: float = 3.175  # Full bleed for marker positioning
+    drawn_bleed_mm: float = 1.0  # Reduced bleed for ink saving
     spacing_mm: float = 0.0
     margin_mm: float = 0.0
     dpi: int = 1200
@@ -45,13 +46,16 @@ class Config:
     grid_rows: int = 3
     
     marker_distance_mm: float = 10.0
-    marker_size_mm: float = 2.0
+    marker_size_mm: float = 4.0  # Extended for better visibility
     marker_line_width_mm: float = 0.3
+    marker_outline_width_mm: float = 0.6
+    marker_dot_size_mm: float = 0.5  # Pink center dot
     
     guide_line_width_mm: float = 0.1
     
-    left_marker_color: tuple = (1, 0, 1)  # Magenta
-    right_marker_color: tuple = (0, 1, 0)  # Green
+    marker_fill_color: tuple = (1, 1, 1)  # White
+    marker_outline_color: tuple = (0, 0, 0)  # Black
+    marker_dot_color: tuple = (1, 0, 1)  # Pink/Magenta
     guide_line_color: tuple = (0, 1, 1)   # Cyan
     
     supported_extensions: tuple = ('.png', '.jpg', '.jpeg', '.tiff', '.webp')
@@ -113,7 +117,7 @@ class PDFGenerator:
         """Process image with mirrored edge bleed.
         
         Creates a bleed area by mirroring the edges of the card image outward.
-        This creates a natural-looking bleed that extends the card design.
+        Uses drawn_bleed_mm for actual ink coverage (saves ink).
         
         Returns:
             Tuple of (bleed_image, card_image) or None if error
@@ -121,7 +125,7 @@ class PDFGenerator:
         card_w = int(self.config.card_width_mm * self.config.dpi / self.config.inch_to_mm)
         card_h = int(self.config.card_height_mm * self.config.dpi / self.config.inch_to_mm)
         
-        bleed_px = int(self.config.bleed_mm * self.config.dpi / self.config.inch_to_mm)
+        bleed_px = int(self.config.drawn_bleed_mm * self.config.dpi / self.config.inch_to_mm)
         bleed_w = card_w + 2 * bleed_px
         bleed_h = card_h + 2 * bleed_px
         
@@ -179,16 +183,25 @@ class PDFGenerator:
     
     def draw_card_with_bleed(self, canvas_obj: canvas.Canvas, bleed_img: Image.Image,
                             card_img: Image.Image, x: float, y: float, layout: Layout):
-        """Draw scaled image for bleed area, then exact card image centered on top."""
-        bleed = self.mm_to_points(self.config.bleed_mm)
+        """Draw mirrored bleed image and card image with reduced bleed for ink saving."""
+        full_bleed = self.mm_to_points(self.config.bleed_mm)
+        drawn_bleed = self.mm_to_points(self.config.drawn_bleed_mm)
         
-        # Draw scaled image to fill entire bleed area (background)
-        canvas_obj.drawImage(ImageReader(bleed_img), x, y,
-                           width=layout.placed_width, height=layout.placed_height)
+        # Calculate dimensions for the reduced bleed area
+        drawn_bleed_width = layout.card_width + 2 * drawn_bleed
+        drawn_bleed_height = layout.card_height + 2 * drawn_bleed
         
-        # Draw exact card image centered on top (offset by bleed on all sides)
+        # Center the drawn bleed within the full placed area
+        offset_x = x + (layout.placed_width - drawn_bleed_width) / 2
+        offset_y = y + (layout.placed_height - drawn_bleed_height) / 2
+        
+        # Draw mirrored bleed image (reduced size for ink saving)
+        canvas_obj.drawImage(ImageReader(bleed_img), offset_x, offset_y,
+                           width=drawn_bleed_width, height=drawn_bleed_height)
+        
+        # Draw exact card image centered on top
         canvas_obj.drawImage(ImageReader(card_img), 
-                           x + bleed, y + bleed,
+                           offset_x + drawn_bleed, offset_y + drawn_bleed,
                            width=layout.card_width, 
                            height=layout.card_height)
     
@@ -213,8 +226,24 @@ class PDFGenerator:
         )
     
     def draw_marker(self, canvas_obj: canvas.Canvas, x: float, y: float, size: float):
+        """Draw a white crosshair marker with black outline and pink center dot."""
+        # Draw black outline first (thicker)
+        canvas_obj.setStrokeColorRGB(*self.config.marker_outline_color)
+        canvas_obj.setLineWidth(self.mm_to_points(self.config.marker_outline_width_mm))
         canvas_obj.line(x - size/2, y, x + size/2, y)
         canvas_obj.line(x, y - size/2, x, y + size/2)
+        
+        # Draw white fill on top (thinner)
+        canvas_obj.setStrokeColorRGB(*self.config.marker_fill_color)
+        canvas_obj.setLineWidth(self.mm_to_points(self.config.marker_line_width_mm))
+        canvas_obj.line(x - size/2, y, x + size/2, y)
+        canvas_obj.line(x, y - size/2, x, y + size/2)
+        
+        # Draw pink dot in center
+        dot_radius = self.mm_to_points(self.config.marker_dot_size_mm) / 2
+        canvas_obj.setFillColorRGB(*self.config.marker_dot_color)
+        canvas_obj.setStrokeColorRGB(*self.config.marker_dot_color)
+        canvas_obj.circle(x, y, dot_radius, fill=1, stroke=0)
     
     def draw_guides(self, canvas_obj: canvas.Canvas, layout: Layout):
         spacing = self.mm_to_points(self.config.spacing_mm)
@@ -231,8 +260,7 @@ class PDFGenerator:
             y = layout.start_y + row * (layout.placed_height + spacing)
             canvas_obj.line(0, y, self.page_width, y)
         
-        # Alignment markers
-        canvas_obj.setLineWidth(self.mm_to_points(self.config.marker_line_width_mm))
+        # Alignment markers (white with black outline)
         marker_dist = self.mm_to_points(self.config.marker_distance_mm)
         marker_size = self.mm_to_points(self.config.marker_size_mm)
         
@@ -247,12 +275,10 @@ class PDFGenerator:
                 bottom_y = card_y
                 
                 if left_x > 0:
-                    canvas_obj.setStrokeColorRGB(*self.config.left_marker_color)
                     self.draw_marker(canvas_obj, left_x, top_y, marker_size)
                     self.draw_marker(canvas_obj, left_x, bottom_y, marker_size)
                 
                 if right_x < self.page_width:
-                    canvas_obj.setStrokeColorRGB(*self.config.right_marker_color)
                     self.draw_marker(canvas_obj, right_x, top_y, marker_size)
                     self.draw_marker(canvas_obj, right_x, bottom_y, marker_size)
     
@@ -391,9 +417,10 @@ def main():
         
         print(f"\nSuccess! Generated {output_path}")
         print(f"Card size: {config.card_width_mm}x{config.card_height_mm}mm")
-        print(f"With bleed: {config.card_width_mm + 2*config.bleed_mm}x{config.card_height_mm + 2*config.bleed_mm}mm")
+        print(f"Drawn bleed: {config.drawn_bleed_mm}mm (ink-saving mirrored edges)")
+        print(f"Marker spacing: {config.bleed_mm}mm (full bleed for alignment)")
         print(f"Spacing: {config.spacing_mm}mm (perfect grid)")
-        print(f"Markers: Left (magenta) and right (green) at {config.marker_distance_mm}mm offset")
+        print(f"Markers: White with black outline at {config.marker_distance_mm}mm offset")
         print(f"Guides: Cyan cutting lines for strip slicing")
         
     except Exception as e:
