@@ -1,428 +1,334 @@
 #!/usr/bin/env python3
-"""
-Trading Card Print Layout Tool
-
-Generates print-ready PDF sheets of trading cards arranged in a 3x3 grid 
-on A4 pages, optimized for machine cutting with color-coded alignment markers.
-"""
 
 import argparse
+import glob
 import os
 import sys
-import glob
-import re
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from io import BytesIO
 from pathlib import Path
-from typing import List, Optional, Tuple
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
     from reportlab.pdfgen import canvas
     from reportlab.lib.utils import ImageReader
-    from reportlab.pdfbase.pdfdoc import PDFDictionary
     from PIL import Image
+    import yaml
 except ImportError as e:
-    print(f"Error: Missing required dependency: {e}")
-    print("Please install required packages: pip install reportlab Pillow")
+    print(f"Missing dependency: {e}")
+    print("Install: pip install reportlab Pillow PyYAML")
     sys.exit(1)
 
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
 
 @dataclass
 class Config:
     card_width_mm: float = 63.0
     card_height_mm: float = 88.0
-    bleed_mm: float = 3.175  # Full bleed for marker positioning
-    drawn_bleed_mm: float = 1.0  # Reduced bleed for ink saving
-    spacing_mm: float = 0.0
-    margin_mm: float = 0.0
-    dpi: int = 1200
-    
+    bleed_mm: float = 1.0
     grid_cols: int = 3
     grid_rows: int = 3
-    
-    marker_distance_mm: float = 10.0
-    marker_size_mm: float = 4.0  # Extended for better visibility
-    marker_line_width_mm: float = 0.3
-    marker_outline_width_mm: float = 0.6
-    marker_dot_size_mm: float = 0.5  # Pink center dot
-    
-    guide_line_width_mm: float = 0.1
-    
-    marker_fill_color: tuple = (1, 1, 1)  # White
-    marker_outline_color: tuple = (0, 0, 0)  # Black
-    marker_dot_color: tuple = (1, 0, 1)  # Pink/Magenta
-    guide_line_color: tuple = (0, 1, 1)   # Cyan
-    
-    supported_extensions: tuple = ('.png', '.jpg', '.jpeg', '.tiff', '.webp')
-    inch_to_mm: float = 25.4
+    dpi: int = 600
+    corner_bevel_mm: float = 2.0
+    corner_line_width_mm: float = 1
+    separator_width_mm: float = 0.2
+    spacing_mm: float = 0.3
     
     @classmethod
-    def from_directory_name(cls, folder_path: str, **overrides) -> 'Config':
-        config = cls(**overrides)
-        folder_name = os.path.basename(os.path.normpath(folder_path))
-        
-        match = re.match(r'^b(\d+(?:\.\d+)?)_m(\d+(?:\.\d+)?)_(.+)$', folder_name)
-        if not match:
-            return config
-            
-        bleed_val, margin_val = float(match.group(1)), float(match.group(2))
-        
-        if bleed_val < 1.0:
-            config.bleed_mm = bleed_val * config.inch_to_mm
-            config.margin_mm = margin_val * config.inch_to_mm
-            print(f"Auto-detected: Bleed {bleed_val}\" ({config.bleed_mm:.3f}mm), Margin {margin_val}\" ({config.margin_mm:.3f}mm)")
-        else:
-            config.bleed_mm = bleed_val
-            config.margin_mm = margin_val
-            print(f"Auto-detected: Bleed {bleed_val}mm, Margin {margin_val}mm")
-            
-        return config
+    def from_yaml(cls, yaml_path: str):
+        if os.path.exists(yaml_path):
+            with open(yaml_path) as f:
+                data = yaml.safe_load(f)
+                return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        return cls()
 
 
-@dataclass
-class Layout:
-    start_x: float
-    start_y: float
-    card_width: float
-    card_height: float
-    placed_width: float
-    placed_height: float
-
-
-# =============================================================================
-# CORE FUNCTIONALITY
-# =============================================================================
-
-class PDFGenerator:
+class CardPuncher:
     def __init__(self, config: Config):
         self.config = config
         self.page_width, self.page_height = A4
+        self.cache: Dict[str, Tuple[ImageReader, ImageReader]] = {}
     
-    def mm_to_points(self, mm_val: float) -> float:
+    def mm_to_pt(self, mm_val: float) -> float:
         return mm_val * mm
         
-    def find_images(self, folder_path: str) -> List[str]:
+    def find_images(self, folder: str) -> List[str]:
+        patterns = ['*.png', '*.jpg', '*.jpeg']
         files = []
-        for ext in self.config.supported_extensions:
-            files.extend(glob.glob(os.path.join(folder_path, f"*{ext}"), recursive=False))
-            files.extend(glob.glob(os.path.join(folder_path, f"*{ext.upper()}"), recursive=False))
-        return sorted(list(set(files)))
+        for pattern in patterns:
+            files.extend(glob.glob(os.path.join(folder, pattern)))
+            files.extend(glob.glob(os.path.join(folder, pattern.upper())))
+        return sorted(set(files))
     
-    def process_image(self, image_path: str) -> Optional[Tuple[Image.Image, Image.Image]]:
-        """Process image with mirrored edge bleed.
+    def create_mirrored_bleed(self, img: Image.Image) -> Image.Image:
+        c = self.config
+        card_w = int(c.card_width_mm * c.dpi / 25.4)
+        card_h = int(c.card_height_mm * c.dpi / 25.4)
+        bleed_px = int(c.bleed_mm * c.dpi / 25.4)
         
-        Creates a bleed area by mirroring the edges of the card image outward.
-        Uses drawn_bleed_mm for actual ink coverage (saves ink).
+        card_img = img.resize((card_w, card_h), Image.Resampling.LANCZOS)
+        bleed_img = Image.new('RGB', (card_w + 2 * bleed_px, card_h + 2 * bleed_px))
+        bleed_img.paste(card_img, (bleed_px, bleed_px))
         
-        Returns:
-            Tuple of (bleed_image, card_image) or None if error
-        """
-        card_w = int(self.config.card_width_mm * self.config.dpi / self.config.inch_to_mm)
-        card_h = int(self.config.card_height_mm * self.config.dpi / self.config.inch_to_mm)
+        edges = [
+            (card_img.crop((0, 0, bleed_px, card_h)).transpose(Image.FLIP_LEFT_RIGHT), (0, bleed_px)),
+            (card_img.crop((card_w - bleed_px, 0, card_w, card_h)).transpose(Image.FLIP_LEFT_RIGHT), (bleed_px + card_w, bleed_px)),
+            (card_img.crop((0, 0, card_w, bleed_px)).transpose(Image.FLIP_TOP_BOTTOM), (bleed_px, 0)),
+            (card_img.crop((0, card_h - bleed_px, card_w, card_h)).transpose(Image.FLIP_TOP_BOTTOM), (bleed_px, bleed_px + card_h)),
+        ]
         
-        bleed_px = int(self.config.drawn_bleed_mm * self.config.dpi / self.config.inch_to_mm)
-        bleed_w = card_w + 2 * bleed_px
-        bleed_h = card_h + 2 * bleed_px
+        corners = [
+            (0, 0, 0, 0), (card_w - bleed_px, 0, bleed_px + card_w, 0),
+            (0, card_h - bleed_px, 0, bleed_px + card_h), (card_w - bleed_px, card_h - bleed_px, bleed_px + card_w, bleed_px + card_h)
+        ]
+        
+        for edge, pos in edges:
+            bleed_img.paste(edge, pos)
+        
+        for x1, y1, x2, y2 in corners:
+            corner = card_img.crop((x1, y1, x1 + bleed_px, y1 + bleed_px))
+            corner = corner.transpose(Image.FLIP_LEFT_RIGHT).transpose(Image.FLIP_TOP_BOTTOM)
+            bleed_img.paste(corner, (x2, y2))
+        
+        return bleed_img
+    
+    def process_image(self, path: str) -> Optional[Tuple[ImageReader, ImageReader]]:
+        if path in self.cache:
+            return self.cache[path]
         
         try:
-            with Image.open(image_path) as img:
+            with Image.open(path) as img:
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
                 
-                # Resize to exact card dimensions
-                card_img = img.resize((card_w, card_h), Image.Resampling.LANCZOS).copy()
+                c = self.config
+                card_w = int(c.card_width_mm * c.dpi / 25.4)
+                card_h = int(c.card_height_mm * c.dpi / 25.4)
                 
-                # Create bleed image with mirrored edges
-                bleed_img = Image.new('RGB', (bleed_w, bleed_h))
+                card_img = img.resize((card_w, card_h), Image.Resampling.LANCZOS)
+                bleed_img = self.create_mirrored_bleed(img)
                 
-                # Place main card image in center
-                bleed_img.paste(card_img, (bleed_px, bleed_px))
-                
-                # Mirror edges outward
-                # Left edge
-                left_strip = card_img.crop((0, 0, bleed_px, card_h))
-                bleed_img.paste(left_strip.transpose(Image.FLIP_LEFT_RIGHT), (0, bleed_px))
-                
-                # Right edge
-                right_strip = card_img.crop((card_w - bleed_px, 0, card_w, card_h))
-                bleed_img.paste(right_strip.transpose(Image.FLIP_LEFT_RIGHT), (bleed_px + card_w, bleed_px))
-                
-                # Top edge
-                top_strip = card_img.crop((0, 0, card_w, bleed_px))
-                bleed_img.paste(top_strip.transpose(Image.FLIP_TOP_BOTTOM), (bleed_px, 0))
-                
-                # Bottom edge
-                bottom_strip = card_img.crop((0, card_h - bleed_px, card_w, card_h))
-                bleed_img.paste(bottom_strip.transpose(Image.FLIP_TOP_BOTTOM), (bleed_px, bleed_px + card_h))
-                
-                # Corners (mirrored in both directions)
-                # Top-left corner
-                tl_corner = card_img.crop((0, 0, bleed_px, bleed_px))
-                bleed_img.paste(tl_corner.transpose(Image.FLIP_LEFT_RIGHT).transpose(Image.FLIP_TOP_BOTTOM), (0, 0))
-                
-                # Top-right corner
-                tr_corner = card_img.crop((card_w - bleed_px, 0, card_w, bleed_px))
-                bleed_img.paste(tr_corner.transpose(Image.FLIP_LEFT_RIGHT).transpose(Image.FLIP_TOP_BOTTOM), (bleed_px + card_w, 0))
-                
-                # Bottom-left corner
-                bl_corner = card_img.crop((0, card_h - bleed_px, bleed_px, card_h))
-                bleed_img.paste(bl_corner.transpose(Image.FLIP_LEFT_RIGHT).transpose(Image.FLIP_TOP_BOTTOM), (0, bleed_px + card_h))
-                
-                # Bottom-right corner
-                br_corner = card_img.crop((card_w - bleed_px, card_h - bleed_px, card_w, card_h))
-                bleed_img.paste(br_corner.transpose(Image.FLIP_LEFT_RIGHT).transpose(Image.FLIP_TOP_BOTTOM), (bleed_px + card_w, bleed_px + card_h))
-                
-                return (bleed_img, card_img)
-        except (IOError, OSError):
+                result = (ImageReader(bleed_img), ImageReader(card_img))
+                self.cache[path] = result
+                return result
+        except Exception:
             return None
     
-    def draw_card_with_bleed(self, canvas_obj: canvas.Canvas, bleed_img: Image.Image,
-                            card_img: Image.Image, x: float, y: float, layout: Layout):
-        """Draw mirrored bleed image and card image with reduced bleed for ink saving."""
-        full_bleed = self.mm_to_points(self.config.bleed_mm)
-        drawn_bleed = self.mm_to_points(self.config.drawn_bleed_mm)
+    def draw_corner_guides(self, c: canvas.Canvas, x: float, y: float, w: float, h: float):
+        bevel = self.mm_to_pt(self.config.corner_bevel_mm) / 2
+        line_w = self.mm_to_pt(self.config.corner_line_width_mm)
+        offset = line_w / 2
         
-        # Calculate dimensions for the reduced bleed area
-        drawn_bleed_width = layout.card_width + 2 * drawn_bleed
-        drawn_bleed_height = layout.card_height + 2 * drawn_bleed
+        c.setLineWidth(line_w)
+        c.setDash([1, 1])
         
-        # Center the drawn bleed within the full placed area
-        offset_x = x + (layout.placed_width - drawn_bleed_width) / 2
-        offset_y = y + (layout.placed_height - drawn_bleed_height) / 2
+        c.setStrokeColorRGB(0, 1, 1)
+        c.line(x, y - offset, x + bevel, y - offset)
+        c.line(x - offset, y, x - offset, y + bevel)
         
-        # Draw mirrored bleed image (reduced size for ink saving)
-        canvas_obj.drawImage(ImageReader(bleed_img), offset_x, offset_y,
-                           width=drawn_bleed_width, height=drawn_bleed_height)
+        c.setStrokeColorRGB(1, 1, 0)
+        c.setDash([1, 1], 1)
+        c.line(x, y - offset, x + bevel, y - offset)
+        c.line(x - offset, y, x - offset, y + bevel)
         
-        # Draw exact card image centered on top
-        canvas_obj.drawImage(ImageReader(card_img), 
-                           offset_x + drawn_bleed, offset_y + drawn_bleed,
-                           width=layout.card_width, 
-                           height=layout.card_height)
+        c.setDash([1, 1], 0)
+        c.setStrokeColorRGB(0, 1, 1)
+        c.line(x + w - bevel, y - offset, x + w, y - offset)
+        c.line(x + w + offset, y, x + w + offset, y + bevel)
+        
+        c.setStrokeColorRGB(1, 1, 0)
+        c.setDash([1, 1], 1)
+        c.line(x + w - bevel, y - offset, x + w, y - offset)
+        c.line(x + w + offset, y, x + w + offset, y + bevel)
+        
+        c.setDash([1, 1], 0)
+        c.setStrokeColorRGB(0, 1, 1)
+        c.line(x, y + h + offset, x + bevel, y + h + offset)
+        c.line(x - offset, y + h - bevel, x - offset, y + h)
+        
+        c.setStrokeColorRGB(1, 1, 0)
+        c.setDash([1, 1], 1)
+        c.line(x, y + h + offset, x + bevel, y + h + offset)
+        c.line(x - offset, y + h - bevel, x - offset, y + h)
+        
+        c.setDash([1, 1], 0)
+        c.setStrokeColorRGB(0, 1, 1)
+        c.line(x + w - bevel, y + h + offset, x + w, y + h + offset)
+        c.line(x + w + offset, y + h - bevel, x + w + offset, y + h)
+        
+        c.setStrokeColorRGB(1, 1, 0)
+        c.setDash([1, 1], 1)
+        c.line(x + w - bevel, y + h + offset, x + w, y + h + offset)
+        c.line(x + w + offset, y + h - bevel, x + w + offset, y + h)
+        
+        c.setDash()
     
-    def calculate_layout(self) -> Layout:
-        placed_w = self.config.card_width_mm + 2 * self.config.bleed_mm
-        placed_h = self.config.card_height_mm + 2 * self.config.bleed_mm
+    def draw_separators(self, c: canvas.Canvas, layout: dict):
+        c.setStrokeColorRGB(0, 1, 1)
+        c.setLineWidth(self.mm_to_pt(self.config.separator_width_mm))
         
-        grid_w = self.config.grid_cols * placed_w + (self.config.grid_cols - 1) * self.config.spacing_mm
-        grid_h = self.config.grid_rows * placed_h + (self.config.grid_rows - 1) * self.config.spacing_mm
-        
-        page_w_mm, page_h_mm = self.page_width / mm, self.page_height / mm
-        center_x = (page_w_mm - grid_w) / 2
-        center_y = (page_h_mm - grid_h) / 2
-        
-        return Layout(
-            start_x=self.mm_to_points(center_x),
-            start_y=self.mm_to_points(center_y),
-            card_width=self.mm_to_points(self.config.card_width_mm),
-            card_height=self.mm_to_points(self.config.card_height_mm),
-            placed_width=self.mm_to_points(placed_w),
-            placed_height=self.mm_to_points(placed_h)
-        )
-    
-    def draw_marker(self, canvas_obj: canvas.Canvas, x: float, y: float, size: float):
-        """Draw a white crosshair marker with black outline and pink center dot."""
-        # Draw black outline first (thicker)
-        canvas_obj.setStrokeColorRGB(*self.config.marker_outline_color)
-        canvas_obj.setLineWidth(self.mm_to_points(self.config.marker_outline_width_mm))
-        canvas_obj.line(x - size/2, y, x + size/2, y)
-        canvas_obj.line(x, y - size/2, x, y + size/2)
-        
-        # Draw white fill on top (thinner)
-        canvas_obj.setStrokeColorRGB(*self.config.marker_fill_color)
-        canvas_obj.setLineWidth(self.mm_to_points(self.config.marker_line_width_mm))
-        canvas_obj.line(x - size/2, y, x + size/2, y)
-        canvas_obj.line(x, y - size/2, x, y + size/2)
-        
-        # Draw pink dot in center
-        dot_radius = self.mm_to_points(self.config.marker_dot_size_mm) / 2
-        canvas_obj.setFillColorRGB(*self.config.marker_dot_color)
-        canvas_obj.setStrokeColorRGB(*self.config.marker_dot_color)
-        canvas_obj.circle(x, y, dot_radius, fill=1, stroke=0)
-    
-    def draw_guides(self, canvas_obj: canvas.Canvas, layout: Layout):
-        spacing = self.mm_to_points(self.config.spacing_mm)
-        
-        # Cutting guide lines
-        canvas_obj.setStrokeColorRGB(*self.config.guide_line_color)
-        canvas_obj.setLineWidth(self.mm_to_points(self.config.guide_line_width_mm))
+        spacing = self.mm_to_pt(self.config.spacing_mm)
+        placed_w = self.mm_to_pt(self.config.card_width_mm + 2 * self.config.bleed_mm)
+        placed_h = self.mm_to_pt(self.config.card_height_mm + 2 * self.config.bleed_mm)
         
         for col in range(1, self.config.grid_cols):
-            x = layout.start_x + col * (layout.placed_width + spacing)
-            canvas_obj.line(x, 0, x, self.page_height)
+            x = layout['start_x'] + col * (placed_w + spacing)
+            c.line(x, 0, x, self.page_height)
             
         for row in range(1, self.config.grid_rows):
-            y = layout.start_y + row * (layout.placed_height + spacing)
-            canvas_obj.line(0, y, self.page_width, y)
-        
-        # Alignment markers (white with black outline)
-        marker_dist = self.mm_to_points(self.config.marker_distance_mm)
-        marker_size = self.mm_to_points(self.config.marker_size_mm)
-        
-        for row in range(self.config.grid_rows):
-            for col in range(self.config.grid_cols):
-                card_x = layout.start_x + col * (layout.placed_width + spacing)
-                card_y = layout.start_y + row * (layout.placed_height + spacing)
-                
-                left_x = card_x - marker_dist
-                right_x = card_x + layout.placed_width + marker_dist
-                top_y = card_y + layout.placed_height
-                bottom_y = card_y
-                
-                if left_x > 0:
-                    self.draw_marker(canvas_obj, left_x, top_y, marker_size)
-                    self.draw_marker(canvas_obj, left_x, bottom_y, marker_size)
-                
-                if right_x < self.page_width:
-                    self.draw_marker(canvas_obj, right_x, top_y, marker_size)
-                    self.draw_marker(canvas_obj, right_x, bottom_y, marker_size)
+            y = layout['start_y'] + row * (placed_h + spacing)
+            c.line(0, y, self.page_width, y)
     
-    def embed_icc_profile(self, canvas_obj: canvas.Canvas, icc_path: str) -> bool:
-        try:
-            with open(icc_path, 'rb') as f:
-                icc_data = f.read()
-            
-            output_intent = PDFDictionary({
-                'Type': '/OutputIntent',
-                'S': '/GTS_PDFX',
-                'OutputConditionIdentifier': 'sRGB',
-                'Info': 'sRGB color space',
-                'OutputCondition': 'sRGB'
-            })
-            
-            canvas_obj._doc.Reference(output_intent)
-            return True
-        except Exception:
-            return False
+    def draw_header(self, c: canvas.Canvas, timestamp: str, total_cards: int, page: int, pages: int):
+        c.setFillColorRGB(0, 0, 1)
+        c.setFont("Helvetica", 7)
+        
+        info = (f"Page {page}/{pages} | {timestamp} | Cards: {total_cards} | "
+                f"Size: {self.config.card_width_mm}x{self.config.card_height_mm}mm | "
+                f"Grid: {self.config.grid_cols}x{self.config.grid_rows} | "
+                f"DPI: {self.config.dpi} | Bleed: {self.config.bleed_mm}mm | "
+                f"Corner bevel: {self.config.corner_bevel_mm}mm")
+        
+        x_offset = 10 + self.mm_to_pt(10)
+        y_offset = self.page_height - 6 - self.mm_to_pt(10)
+        c.drawString(x_offset, y_offset, info)
     
-    def generate_pdf(self, folder_path: str, output_path: str, icc_path: Optional[str] = None) -> str:
-        images = self.find_images(folder_path)
+    def calculate_layout(self) -> dict:
+        placed_w = self.mm_to_pt(self.config.card_width_mm + 2 * self.config.bleed_mm)
+        placed_h = self.mm_to_pt(self.config.card_height_mm + 2 * self.config.bleed_mm)
+        spacing = self.mm_to_pt(self.config.spacing_mm)
+        
+        grid_w = self.config.grid_cols * placed_w + (self.config.grid_cols - 1) * spacing
+        grid_h = self.config.grid_rows * placed_h + (self.config.grid_rows - 1) * spacing
+        
+        return {
+            'start_x': (self.page_width - grid_w) / 2,
+            'start_y': (self.page_height - grid_h) / 2,
+            'card_w': self.mm_to_pt(self.config.card_width_mm),
+            'card_h': self.mm_to_pt(self.config.card_height_mm),
+            'placed_w': placed_w,
+            'placed_h': placed_h,
+            'spacing': spacing
+        }
+    
+    def generate(self, input_folder: str, output_path: str):
+        images = self.find_images(input_folder)
         if not images:
-            raise FileNotFoundError(f"No supported images found in {folder_path}")
+            raise FileNotFoundError(f"No images found in {input_folder}")
         
+        cardback_path = os.path.join(input_folder, 'cardback.png')
+        if not os.path.exists(cardback_path):
+            cardback_path = os.path.join(input_folder, 'CARDBACK.PNG')
+        has_cardback = os.path.exists(cardback_path)
+        
+        images = [img for img in images if 'cardback' not in img.lower()]
+        
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         layout = self.calculate_layout()
-        canvas_obj = canvas.Canvas(output_path, pagesize=A4)
-        
-        if icc_path and os.path.exists(icc_path):
-            self.embed_icc_profile(canvas_obj, icc_path)
+        c = canvas.Canvas(output_path, pagesize=A4)
         
         cards_per_page = self.config.grid_cols * self.config.grid_rows
-        pages = (len(images) + cards_per_page - 1) // cards_per_page
-        spacing = self.mm_to_points(self.config.spacing_mm)
+        total_pages = (len(images) + cards_per_page - 1) // cards_per_page
+        bleed_pt = self.mm_to_pt(self.config.bleed_mm)
         
-        for page in range(pages):
-            start_idx = page * cards_per_page
-            page_images = images[start_idx:start_idx + cards_per_page]
+        for page in range(total_pages):
+            self.draw_header(c, timestamp, len(images), page + 1, total_pages)
+            
+            page_images = images[page * cards_per_page:(page + 1) * cards_per_page]
             
             for i, img_path in enumerate(page_images):
                 row, col = divmod(i, self.config.grid_cols)
-                x = layout.start_x + col * (layout.placed_width + spacing)
-                y = layout.start_y + (self.config.grid_rows - 1 - row) * (layout.placed_height + spacing)
+                x = layout['start_x'] + col * (layout['placed_w'] + layout['spacing'])
+                y = layout['start_y'] + (self.config.grid_rows - 1 - row) * (layout['placed_h'] + layout['spacing'])
                 
-                processed_imgs = self.process_image(img_path)
-                if processed_imgs:
-                    bleed_img, card_img = processed_imgs
-                    self.draw_card_with_bleed(canvas_obj, bleed_img, card_img, x, y, layout)
+                result = self.process_image(img_path)
+                if result:
+                    bleed_reader, card_reader = result
+                    
+                    c.drawImage(bleed_reader, x, y, width=layout['placed_w'], height=layout['placed_h'])
+                    c.drawImage(card_reader, x + bleed_pt, y + bleed_pt, 
+                              width=layout['card_w'], height=layout['card_h'])
+                    
+                    card_x = x + bleed_pt
+                    card_y = y + bleed_pt
+                    self.draw_corner_guides(c, card_x, card_y, layout['card_w'], layout['card_h'])
             
-            self.draw_guides(canvas_obj, layout)
+            self.draw_separators(c, layout)
             
-            if page < pages - 1:
-                canvas_obj.showPage()
+            if has_cardback:
+                c.showPage()
+                self.draw_header(c, timestamp, len(images), page + 1, total_pages)
+                
+                cardback_result = self.process_image(cardback_path)
+                if cardback_result:
+                    bleed_reader, card_reader = cardback_result
+                    
+                    for i in range(len(page_images)):
+                        row, col = divmod(i, self.config.grid_cols)
+                        mirrored_col = self.config.grid_cols - 1 - col
+                        x = layout['start_x'] + mirrored_col * (layout['placed_w'] + layout['spacing'])
+                        y = layout['start_y'] + (self.config.grid_rows - 1 - row) * (layout['placed_h'] + layout['spacing'])
+                        
+                        c.drawImage(bleed_reader, x, y, width=layout['placed_w'], height=layout['placed_h'])
+                        c.drawImage(card_reader, x + bleed_pt, y + bleed_pt, 
+                                  width=layout['card_w'], height=layout['card_h'])
+                        
+                        card_x = x + bleed_pt
+                        card_y = y + bleed_pt
+                        self.draw_corner_guides(c, card_x, card_y, layout['card_w'], layout['card_h'])
+                
+                self.draw_separators(c, layout)
+            
+            if page < total_pages - 1:
+                c.showPage()
         
-        canvas_obj.save()
+        c.save()
         return output_path
 
 
-# =============================================================================
-# CLI INTERFACE
-# =============================================================================
-
-def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Generate print-ready PDF sheets of trading cards in 3x3 grid layout",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python pdf.py "my_deck"
-  python pdf.py "b0.125_m0_my_deck"  # Auto-detect 1/8" bleed, 0 margin
-  python pdf.py "b2_m1_my_deck"      # Auto-detect 2mm bleed, 1mm margin
-
-Directory naming: b{bleed}_m{margin}_{name}
-  Values < 1.0 = inches, >= 1.0 = millimeters
-        """
-    )
-    
-    parser.add_argument('folder_path', help='Path to folder containing card images')
-    parser.add_argument('--card-w-mm', type=float, default=63.0, help='Card width (mm)')
-    parser.add_argument('--card-h-mm', type=float, default=88.0, help='Card height (mm)')
-    parser.add_argument('--bleed-mm', type=float, help='Bleed area (mm)')
-    parser.add_argument('--margin-mm', type=float, help='Page margin (mm)')
-    parser.add_argument('--dpi', type=int, default=1200, help='Image DPI')
-    parser.add_argument('--icc', type=str, default="sRGB.icc", help='ICC profile path')
-    parser.add_argument('--card-spacing-mm', type=float, default=0.0, help='Card spacing (mm)')
-    parser.add_argument('--no-auto-detect', action='store_true', help='Disable auto-detection')
-    
-    return parser
-
-
 def main():
-    parser = create_parser()
+    parser = argparse.ArgumentParser(description='CardPuncher - Print-ready card layouts')
+    parser.add_argument('folder', help='Folder containing card images')
+    parser.add_argument('--config', help='YAML config file', default='cardpuncher.yaml')
+    parser.add_argument('--dpi', type=int, help='Image resolution')
+    parser.add_argument('--card-width-mm', type=float, help='Card width (mm)')
+    parser.add_argument('--card-height-mm', type=float, help='Card height (mm)')
+    
     args = parser.parse_args()
     
-    # Validate inputs
-    for val, name in [(args.card_w_mm, "card width"), (args.card_h_mm, "card height"), (args.dpi, "DPI")]:
-        if val <= 0:
-            print(f"Error: {name} must be positive")
-            sys.exit(1)
+    config = Config.from_yaml(args.config)
+    if args.dpi:
+        config.dpi = args.dpi
+    if args.card_width_mm:
+        config.card_width_mm = args.card_width_mm
+    if args.card_height_mm:
+        config.card_height_mm = args.card_height_mm
     
-    for val, name in [(args.bleed_mm, "bleed"), (args.margin_mm, "margin"), (args.card_spacing_mm, "spacing")]:
-        if val is not None and val < 0:
-            print(f"Error: {name} cannot be negative")
-            sys.exit(1)
+    script_dir = Path(__file__).parent
+    output_dir = script_dir / 'output'
+    output_dir.mkdir(exist_ok=True)
     
-    # Create configuration
-    overrides = {
-        'card_width_mm': args.card_w_mm,
-        'card_height_mm': args.card_h_mm,
-        'spacing_mm': args.card_spacing_mm,
-        'dpi': args.dpi
-    }
-    
-    if args.bleed_mm is not None:
-        overrides['bleed_mm'] = args.bleed_mm
-    if args.margin_mm is not None:
-        overrides['margin_mm'] = args.margin_mm
-    
-    if args.no_auto_detect:
-        config = Config(**overrides)
-        if args.bleed_mm is None:
-            config.bleed_mm = 3.175
-        if args.margin_mm is None:
-            config.margin_mm = 0.0
-    else:
-        config = Config.from_directory_name(args.folder_path, **overrides)
-    
-    # Generate PDF
-    output_path = f"{os.path.basename(os.path.normpath(args.folder_path))}.pdf"
-    icc_path = args.icc if os.path.exists(args.icc) else None
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    folder_name = Path(args.folder).name
+    output_path = output_dir / f"{folder_name}_{timestamp}.pdf"
     
     try:
-        generator = PDFGenerator(config)
-        generator.generate_pdf(args.folder_path, output_path, icc_path)
+        puncher = CardPuncher(config)
+        puncher.generate(args.folder, str(output_path))
         
-        print(f"\nSuccess! Generated {output_path}")
-        print(f"Card size: {config.card_width_mm}x{config.card_height_mm}mm")
-        print(f"Drawn bleed: {config.drawn_bleed_mm}mm (ink-saving mirrored edges)")
-        print(f"Marker spacing: {config.bleed_mm}mm (full bleed for alignment)")
-        print(f"Spacing: {config.spacing_mm}mm (perfect grid)")
-        print(f"Markers: White with black outline at {config.marker_distance_mm}mm offset")
-        print(f"Guides: Cyan cutting lines for strip slicing")
+        fronts = [img for img in puncher.find_images(args.folder) if 'cardback' not in img.lower()]
+        cardback_path = os.path.join(args.folder, 'cardback.png')
+        has_back = os.path.exists(cardback_path) or os.path.exists(os.path.join(args.folder, 'CARDBACK.PNG'))
         
+        print(f"\nSuccess! {output_path}")
+        print(f"Cards: {len(fronts)} | "
+              f"Size: {config.card_width_mm}x{config.card_height_mm}mm | "
+              f"Grid: {config.grid_cols}x{config.grid_rows} | "
+              f"DPI: {config.dpi}")
+        if has_back:
+            print(f"Double-sided: Yes (interleaved backs)")
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(1)

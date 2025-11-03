@@ -1,0 +1,10 @@
+card_width_mm: 63.0
+card_height_mm: 88.0
+bleed_mm: 1.0
+grid_cols: 3
+grid_rows: 3
+dpi: 600
+corner_bevel_mm: 2.0
+corner_line_width_mm: 0.6
+separator_width_mm: 0.2
+spacing_mm: 0.3
